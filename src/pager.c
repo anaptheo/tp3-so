@@ -1,366 +1,391 @@
 #include "pager.h"
-#include "mmu.h"
+
+#include <errno.h>
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <string.h>
-#include <errno.h>
-
 #include <sys/mman.h>
 #include <unistd.h>
 
-typedef struct Page {
-    intptr_t vaddr;
-    int frame;      // -1 if not in memory
-    int block;      // -1 if not on disk
-    int resident;   // 1 if in memory, 0 otherwise
-    int referenced; // for second chance
-    int dirty;      // 1 if written to
-    int initialized; // 1 if mmu_zero_fill called or loaded from disk
-    int disk_valid; // 1 if disk block contains valid data
-    int prot;       // Current protection level
-    struct Page *next;
-} Page;
+#include "mmu.h"
 
-typedef struct Process {
-    pid_t pid;
-    Page *pages;
-    struct Process *next;
-} Process;
+/* Page metadata tracked by the pager. */
+struct page_info {
+	int allocated;
+	void *vaddr;
+	int block;
+	int frame;
+	int prot;
+	int dirty;
+	int on_disk;
+};
 
-typedef struct Frame {
-    int in_use;
-    pid_t pid;
-    intptr_t vaddr; // to easily find the page struct if needed, or just use pid/vaddr to search
-} Frame;
+/* Per-process bookkeeping. */
+struct process_info {
+	pid_t pid;
+	size_t npages;
+	size_t capacity;
+	int active;
+	struct page_info *pages;
+};
 
-// Global variables
-int g_nframes;
-int g_nblocks;
-Frame *g_frames;
-int *g_blocks; // 0 = free, 1 = used
-Process *g_processes = NULL;
-pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Physical frame metadata used by the clock algorithm. */
+struct frame_info {
+	int used;
+	pid_t pid;
+	size_t page_idx;
+	int referenced;
+};
 
-// Second chance algorithm state
-int g_clock_hand = 0;
+static pthread_mutex_t pager_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct frame_info *frames = NULL;
+static int *block_used = NULL;
+static struct process_info *procs = NULL;
+static size_t procs_count = 0;
+static size_t procs_capacity = 0;
+static int total_frames = 0;
+static int total_blocks = 0;
+static size_t page_size = 0;
+static size_t max_pages = 0;
+static int clock_hand = 0;
+
+static struct process_info *find_process(pid_t pid);
+static struct process_info *alloc_process(pid_t pid);
+static int allocate_block(void);
+static void release_process_resources(struct process_info *p);
+static size_t addr_to_index(void *addr);
+static int find_free_frame(void);
+static int evict_frame(void);
+static int obtain_frame(void);
+static void mark_frame(int frame, pid_t pid, size_t page_idx);
+static void map_page_into_frame(struct process_info *p, size_t page_idx, int frame);
+static void handle_resident_access(struct process_info *p, struct page_info *pg, int frame, int write_request);
 
 void pager_init(int nframes, int nblocks) {
-    pthread_mutex_lock(&g_mutex);
-    g_nframes = nframes;
-    g_nblocks = nblocks;
+	pthread_mutex_lock(&pager_mutex);
+	page_size = (size_t)sysconf(_SC_PAGESIZE);
+	max_pages = (size_t)((UVM_MAXADDR - UVM_BASEADDR + 1) / page_size);
+	total_frames = nframes;
+	total_blocks = nblocks;
+	clock_hand = 0;
 
-    g_frames = malloc(sizeof(Frame) * nframes);
-    for (int i = 0; i < nframes; i++) {
-        g_frames[i].in_use = 0;
-        g_frames[i].pid = -1;
-        g_frames[i].vaddr = 0;
-    }
-
-    g_blocks = malloc(sizeof(int) * nblocks);
-    for (int i = 0; i < nblocks; i++) {
-        g_blocks[i] = 0;
-    }
-    pthread_mutex_unlock(&g_mutex);
+	frames = calloc((size_t)nframes, sizeof(*frames));
+	block_used = calloc((size_t)nblocks, sizeof(*block_used));
+	procs_capacity = 4;
+	procs = calloc(procs_capacity, sizeof(*procs));
+	pthread_mutex_unlock(&pager_mutex);
 }
 
 void pager_create(pid_t pid) {
-    pthread_mutex_lock(&g_mutex);
-    Process *proc = malloc(sizeof(Process));
-    proc->pid = pid;
-    proc->pages = NULL;
-    proc->next = g_processes;
-    g_processes = proc;
-    pthread_mutex_unlock(&g_mutex);
-}
-
-void pager_destroy(pid_t pid) {
-    pthread_mutex_lock(&g_mutex);
-    Process **curr = &g_processes;
-    while (*curr) {
-        if ((*curr)->pid == pid) {
-            Process *to_free = *curr;
-            *curr = (*curr)->next;
-            
-            // Free pages and resources
-            Page *p = to_free->pages;
-            while (p) {
-                Page *next_p = p->next;
-                if (p->frame != -1) {
-                    g_frames[p->frame].in_use = 0;
-                    g_frames[p->frame].pid = -1;
-                }
-                if (p->block != -1) {
-                    g_blocks[p->block] = 0;
-                }
-                free(p);
-                p = next_p;
-            }
-            free(to_free);
-            break;
-        }
-        curr = &(*curr)->next;
-    }
-    pthread_mutex_unlock(&g_mutex);
+	pthread_mutex_lock(&pager_mutex);
+	alloc_process(pid);
+	pthread_mutex_unlock(&pager_mutex);
 }
 
 void *pager_extend(pid_t pid) {
-    pthread_mutex_lock(&g_mutex);
-    
-    // Find process
-    Process *proc = g_processes;
-    while (proc && proc->pid != pid) {
-        proc = proc->next;
-    }
-    
-    if (!proc) {
-        pthread_mutex_unlock(&g_mutex);
-        return NULL; // Should not happen if pager_create was called
-    }
+	pthread_mutex_lock(&pager_mutex);
+	struct process_info *p = find_process(pid);
+	if(!p) {
+		pthread_mutex_unlock(&pager_mutex);
+		return NULL;
+	}
+	if(p->npages >= max_pages) {
+		errno = ENOSPC;
+		pthread_mutex_unlock(&pager_mutex);
+		return NULL;
+	}
+	int block = allocate_block();
+	if(block == -1) {
+		errno = ENOSPC;
+		pthread_mutex_unlock(&pager_mutex);
+		return NULL;
+	}
 
-    // Allocate disk block
-    int block = -1;
-    for (int i = 0; i < g_nblocks; i++) {
-        if (g_blocks[i] == 0) {
-            g_blocks[i] = 1;
-            block = i;
-            break;
-        }
-    }
+	size_t idx = p->npages;
+	struct page_info *pg = &p->pages[idx];
+	pg->allocated = 1;
+	pg->vaddr = (void *)(UVM_BASEADDR + idx * page_size);
+	pg->block = block;
+	pg->frame = -1;
+	pg->prot = PROT_NONE;
+	pg->dirty = 0;
+	pg->on_disk = 0;
+	p->npages++;
 
-    if (block == -1) {
-        pthread_mutex_unlock(&g_mutex);
-        return NULL;
-    }
-
-    // Create new page
-    Page *page = malloc(sizeof(Page));
-    
-    // Calculate vaddr
-    // If first page, UVM_BASEADDR. Else, last page + PAGESIZE (assumed 4096 based on mmu.h comments or sysconf)
-    // mmu.h says UVM_BASEADDR is 0x60000000.
-    // We need to find the last page to determine the new address.
-    
-    intptr_t new_vaddr = UVM_BASEADDR;
-    Page *last = proc->pages;
-    if (last) {
-        while (last->next) {
-            last = last->next;
-        }
-        new_vaddr = last->vaddr + sysconf(_SC_PAGESIZE);
-    } else {
-        // First page
-        new_vaddr = UVM_BASEADDR;
-    }
-    
-    // Check bounds? UVM_MAXADDR is 0x600FFFFF.
-    if (new_vaddr > UVM_MAXADDR) {
-        g_blocks[block] = 0; // Release block
-        free(page);
-        pthread_mutex_unlock(&g_mutex);
-        return NULL;
-    }
-
-    page->vaddr = new_vaddr;
-    page->frame = -1;
-    page->block = block;
-    page->resident = 0;
-    page->referenced = 0;
-    page->dirty = 0;
-    page->initialized = 0;
-    page->disk_valid = 0;
-    page->next = NULL;
-
-    if (proc->pages) {
-        last->next = page;
-    } else {
-        proc->pages = page;
-    }
-
-    pthread_mutex_unlock(&g_mutex);
-    return (void *)new_vaddr;
-}
-
-void _pager_fault(pid_t pid, void *addr) {
-    intptr_t vaddr = (intptr_t)addr;
-    // Align to page boundary
-    vaddr = vaddr & ~(sysconf(_SC_PAGESIZE) - 1);
-
-    // Find process
-    Process *proc = g_processes;
-    while (proc && proc->pid != pid) {
-        proc = proc->next;
-    }
-    
-    if (!proc) return;
-
-    // Find page
-    Page *page = proc->pages;
-    while (page && page->vaddr != vaddr) {
-        page = page->next;
-    }
-
-    if (!page) return;
-
-    if (page->resident) {
-        // Resident page fault -> Protection fault
-        if (page->prot == PROT_NONE) {
-            // Was waiting for second chance access
-            page->referenced = 1;
-            page->prot = PROT_READ;
-            mmu_chprot(pid, (void*)vaddr, PROT_READ);
-        } else if (page->prot == PROT_READ) {
-            // Write access (assumed, since it faulted on READ)
-            page->referenced = 1;
-            page->dirty = 1;
-            page->prot = PROT_READ | PROT_WRITE;
-            mmu_chprot(pid, (void*)vaddr, PROT_READ | PROT_WRITE);
-        }
-    } else {
-        // Non-resident page fault -> Bring into memory
-        int frame = -1;
-        
-        // Look for free frame
-        for (int i = 0; i < g_nframes; i++) {
-            if (!g_frames[i].in_use) {
-                frame = i;
-                break;
-            }
-        }
-
-        // If no free frame, evict
-        if (frame == -1) {
-            while (frame == -1) {
-                Frame *f = &g_frames[g_clock_hand];
-                
-                // Find owner page
-                Process *owner = g_processes;
-                while (owner && owner->pid != f->pid) {
-                    owner = owner->next;
-                }
-                Page *owner_page = NULL;
-                if (owner) {
-                    owner_page = owner->pages;
-                    while (owner_page && owner_page->vaddr != f->vaddr) {
-                        owner_page = owner_page->next;
-                    }
-                }
-
-                if (owner_page) {
-                    if (owner_page->referenced) {
-                        owner_page->referenced = 0;
-                        owner_page->prot = PROT_NONE;
-                        mmu_chprot(f->pid, (void*)f->vaddr, PROT_NONE);
-                    } else {
-                        // Evict
-                        mmu_nonresident(f->pid, (void*)f->vaddr);
-                        
-                        if (owner_page->dirty) {
-                            mmu_disk_write(g_clock_hand, owner_page->block);
-                            owner_page->dirty = 0;
-                            owner_page->disk_valid = 1;
-                        }
-                        owner_page->resident = 0;
-                        owner_page->frame = -1;
-                        owner_page->prot = 0;
-                        
-                        f->in_use = 0;
-                        frame = g_clock_hand;
-                    }
-                } else {
-                    f->in_use = 0;
-                    frame = g_clock_hand;
-                }
-
-                g_clock_hand = (g_clock_hand + 1) % g_nframes;
-            }
-        }
-
-        // Use frame
-        g_frames[frame].in_use = 1;
-        g_frames[frame].pid = pid;
-        g_frames[frame].vaddr = vaddr;
-
-        if (page->disk_valid) {
-            mmu_disk_read(page->block, frame);
-        } else {
-            mmu_zero_fill(frame);
-        }
-        page->initialized = 1;
-
-        page->frame = frame;
-        page->resident = 1;
-        page->referenced = 1;
-        page->prot = PROT_READ;
-        page->dirty = 0;
-        
-        mmu_resident(pid, (void*)vaddr, frame, PROT_READ);
-    }
+	void *ret = pg->vaddr;
+	pthread_mutex_unlock(&pager_mutex);
+	return ret;
 }
 
 void pager_fault(pid_t pid, void *addr) {
-    pthread_mutex_lock(&g_mutex);
-    _pager_fault(pid, addr);
-    pthread_mutex_unlock(&g_mutex);
+	pthread_mutex_lock(&pager_mutex);
+	struct process_info *p = find_process(pid);
+	if(!p) {
+		pthread_mutex_unlock(&pager_mutex);
+		return;
+	}
+	size_t idx = addr_to_index(addr);
+	if(idx >= p->npages) {
+		pthread_mutex_unlock(&pager_mutex);
+		return;
+	}
+	struct page_info *pg = &p->pages[idx];
+
+	if(pg->frame != -1) {
+		int write_request = (pg->prot == PROT_READ);
+		handle_resident_access(p, pg, pg->frame, write_request);
+		pthread_mutex_unlock(&pager_mutex);
+		return;
+	}
+
+	int frame = obtain_frame();
+	map_page_into_frame(p, idx, frame);
+	pthread_mutex_unlock(&pager_mutex);
 }
 
 int pager_syslog(pid_t pid, void *addr, size_t len) {
-    pthread_mutex_lock(&g_mutex);
-    
-    Process *proc = g_processes;
-    while (proc && proc->pid != pid) {
-        proc = proc->next;
-    }
-    
-    if (!proc) {
-        pthread_mutex_unlock(&g_mutex);
-        return -1;
-    }
+	pthread_mutex_lock(&pager_mutex);
+	struct process_info *p = find_process(pid);
+	if(!p) {
+		errno = EINVAL;
+		pthread_mutex_unlock(&pager_mutex);
+		return -1;
+	}
+	uintptr_t start = (uintptr_t)addr;
+	uintptr_t base = (uintptr_t)UVM_BASEADDR;
+	if(start < base) {
+		errno = EINVAL;
+		pthread_mutex_unlock(&pager_mutex);
+		return -1;
+	}
+	size_t offset = (size_t)(start - base);
+	size_t allocated = p->npages * page_size;
+	if(offset > allocated || len > allocated - offset) {
+		errno = EINVAL;
+		pthread_mutex_unlock(&pager_mutex);
+		return -1;
+	}
+	if(len == 0) {
+		pthread_mutex_unlock(&pager_mutex);
+		return 0;
+	}
 
-    // Validate range
-    for (size_t i = 0; i < len; i++) {
-        intptr_t curr_vaddr = (intptr_t)addr + i;
-        intptr_t page_vaddr = curr_vaddr & ~(sysconf(_SC_PAGESIZE) - 1);
-        
-        Page *page = proc->pages;
-        while (page && page->vaddr != page_vaddr) {
-            page = page->next;
-        }
-        
-        if (!page) {
-            pthread_mutex_unlock(&g_mutex);
-            return -1;
-        }
-    }
+	unsigned char *buf = malloc(len);
+	if(!buf) {
+		pthread_mutex_unlock(&pager_mutex);
+		return -1;
+	}
 
-    // Print
-    for (size_t i = 0; i < len; i++) {
-        intptr_t curr_vaddr = (intptr_t)addr + i;
-        intptr_t page_vaddr = curr_vaddr & ~(sysconf(_SC_PAGESIZE) - 1);
-        int offset = curr_vaddr & (sysconf(_SC_PAGESIZE) - 1);
+	size_t done = 0;
+	while(done < len) {
+		size_t cur = offset + done;
+		size_t page_idx = cur / page_size;
+		size_t inpage = cur % page_size;
+		size_t chunk = len - done;
+		if(chunk > page_size - inpage) {
+			chunk = page_size - inpage;
+		}
+		struct page_info *pg = &p->pages[page_idx];
+		if(pg->frame == -1) {
+			int frame = obtain_frame();
+			map_page_into_frame(p, page_idx, frame);
+		} else {
+			handle_resident_access(p, pg, pg->frame, 0);
+		}
+		if(pg->frame != -1) {
+			frames[pg->frame].referenced = 1;
+		}
+		size_t phys_off = (size_t)pg->frame * page_size + inpage;
+		memcpy(buf + done, pmem + phys_off, chunk);
+		done += chunk;
+	}
+	pthread_mutex_unlock(&pager_mutex);
 
-        Page *page = proc->pages;
-        while (page && page->vaddr != page_vaddr) {
-            page = page->next;
-        }
+	for(size_t i = 0; i < len; ++i) {
+		printf("%02x", (unsigned)buf[i]);
+	}
+	printf("\n");
+	free(buf);
+	return 0;
+}
 
-        // Ensure resident (read access)
-        if (!page->resident || page->prot == PROT_NONE) {
-            _pager_fault(pid, (void*)curr_vaddr);
-        }
-        // If it was PROT_READ, it's fine. If PROT_WRITE, also fine.
-        // But _pager_fault might have just made it resident.
-        
-        // Access pmem
-        // pmem is char*, so we can index it.
-        // frame index * pagesize + offset
-        int frame = page->frame;
-        printf("%02x", (unsigned char)pmem[frame * sysconf(_SC_PAGESIZE) + offset]);
-    }
-    if (len > 0) {
-        printf("\n");
-    }
-    
-    pthread_mutex_unlock(&g_mutex);
-    return 0;
+void pager_destroy(pid_t pid) {
+	pthread_mutex_lock(&pager_mutex);
+	struct process_info *p = find_process(pid);
+	if(!p) {
+		pthread_mutex_unlock(&pager_mutex);
+		return;
+	}
+	release_process_resources(p);
+	pthread_mutex_unlock(&pager_mutex);
+}
+
+static struct process_info *find_process(pid_t pid) {
+	for(size_t i = 0; i < procs_count; ++i) {
+		if(procs[i].active && procs[i].pid == pid) {
+			return &procs[i];
+		}
+	}
+	return NULL;
+}
+
+static struct process_info *alloc_process(pid_t pid) {
+	struct process_info *slot = NULL;
+	for(size_t i = 0; i < procs_count; ++i) {
+		if(!procs[i].active) {
+			slot = &procs[i];
+			break;
+		}
+	}
+	if(!slot) {
+		if(procs_count == procs_capacity) {
+			size_t newcap = procs_capacity ? procs_capacity * 2 : 4;
+			struct process_info *tmp = realloc(procs, newcap * sizeof(*procs));
+			if(!tmp) exit(EXIT_FAILURE);
+			procs = tmp;
+			for(size_t i = procs_capacity; i < newcap; ++i) {
+				memset(&procs[i], 0, sizeof(procs[i]));
+			}
+			procs_capacity = newcap;
+		}
+		slot = &procs[procs_count++];
+	}
+	slot->pid = pid;
+	slot->npages = 0;
+	slot->capacity = max_pages;
+	slot->active = 1;
+	slot->pages = calloc(max_pages, sizeof(*slot->pages));
+	return slot;
+}
+
+static int allocate_block(void) {
+	for(int i = 0; i < total_blocks; ++i) {
+		if(!block_used[i]) {
+			block_used[i] = 1;
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void release_process_resources(struct process_info *p) {
+	for(size_t i = 0; i < p->npages; ++i) {
+		struct page_info *pg = &p->pages[i];
+		if(!pg->allocated) continue;
+		if(pg->frame != -1) {
+			int frame = pg->frame;
+			frames[frame].used = 0;
+			frames[frame].referenced = 0;
+			frames[frame].pid = 0;
+			frames[frame].page_idx = 0;
+			pg->frame = -1;
+		}
+		if(pg->block >= 0 && pg->block < total_blocks) {
+			block_used[pg->block] = 0;
+		}
+	}
+	free(p->pages);
+	p->pages = NULL;
+	p->npages = 0;
+	p->active = 0;
+}
+
+static size_t addr_to_index(void *addr) {
+	return ((uintptr_t)addr - (uintptr_t)UVM_BASEADDR) / page_size;
+}
+
+static int find_free_frame(void) {
+	for(int i = 0; i < total_frames; ++i) {
+		if(!frames[i].used) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int evict_frame(void) {
+	while(1) {
+		int frame = clock_hand;
+		if(!frames[frame].used) {
+			clock_hand = (clock_hand + 1) % total_frames;
+			return frame;
+		}
+		struct process_info *p = find_process(frames[frame].pid);
+		if(!p) {
+			frames[frame].used = 0;
+			clock_hand = (clock_hand + 1) % total_frames;
+			return frame;
+		}
+		struct page_info *pg = &p->pages[frames[frame].page_idx];
+		if(frames[frame].referenced) {
+			mmu_chprot(p->pid, pg->vaddr, PROT_NONE);
+			pg->prot = PROT_NONE;
+			frames[frame].referenced = 0;
+			clock_hand = (clock_hand + 1) % total_frames;
+			continue;
+		}
+		mmu_nonresident(p->pid, pg->vaddr);
+		if(pg->dirty) {
+			mmu_disk_write(frame, pg->block);
+			pg->dirty = 0;
+			pg->on_disk = 1;
+		}
+		pg->frame = -1;
+		pg->prot = PROT_NONE;
+		frames[frame].used = 0;
+		frames[frame].referenced = 0;
+		frames[frame].pid = 0;
+		frames[frame].page_idx = 0;
+		clock_hand = (clock_hand + 1) % total_frames;
+		return frame;
+	}
+}
+
+static int obtain_frame(void) {
+	int frame = find_free_frame();
+	if(frame != -1) {
+		return frame;
+	}
+	return evict_frame();
+}
+
+static void mark_frame(int frame, pid_t pid, size_t page_idx) {
+	frames[frame].used = 1;
+	frames[frame].pid = pid;
+	frames[frame].page_idx = page_idx;
+	frames[frame].referenced = 1;
+	clock_hand = (frame + 1) % total_frames;
+}
+
+static void map_page_into_frame(struct process_info *p, size_t page_idx, int frame) {
+	struct page_info *pg = &p->pages[page_idx];
+	if(pg->on_disk) {
+		mmu_disk_read(pg->block, frame);
+	} else {
+		mmu_zero_fill(frame);
+	}
+	mmu_resident(p->pid, pg->vaddr, frame, PROT_READ);
+	pg->frame = frame;
+	pg->prot = PROT_READ;
+	pg->dirty = 0;
+	mark_frame(frame, p->pid, page_idx);
+}
+
+static void handle_resident_access(struct process_info *p, struct page_info *pg, int frame, int write_request) {
+	if(pg->prot == PROT_NONE) {
+		int prot = pg->dirty ? (PROT_READ | PROT_WRITE) : PROT_READ;
+		mmu_chprot(p->pid, pg->vaddr, prot);
+		pg->prot = prot;
+	}
+	if(write_request && pg->prot == PROT_READ) {
+		mmu_chprot(p->pid, pg->vaddr, PROT_READ | PROT_WRITE);
+		pg->prot = PROT_READ | PROT_WRITE;
+		pg->dirty = 1;
+	} else if(write_request && pg->prot == (PROT_READ | PROT_WRITE)) {
+		pg->dirty = 1;
+	}
+	frames[frame].referenced = 1;
 }
