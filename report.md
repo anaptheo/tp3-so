@@ -11,7 +11,8 @@
     Preencha as linhas abaixo com o nome e o email dos integrantes do grupo.  Substitua marcadores `XX` pela contribuição de cada membro do grupo no desenvolvimento do trabalho (os valores devem somar 100%).
 
     * Ana Paula Pereira Theobald anatheobald@ufmg.br 33%
-    * Nome2 <email2> XX%
+    * Caio Souza Grossi csgrossi@ufmg.br 33%
+    * Pedro Bacelar Rigueira pedrobacelar@ufmg.br 33%
 
 3. Referências bibliográficas
 
