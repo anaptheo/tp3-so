@@ -38,3 +38,16 @@
        *   **Detecção de Acesso (Leitura/Escrita):** Quando uma página é carregada na memória, ela recebe inicialmente permissão `PROT_READ`. Se o processo tentar escrever nela, ocorrerá uma falha de proteção. O paginador intercepta essa falha, marca a página como `dirty` e `referenced`, e atualiza a permissão para `PROT_READ | PROT_WRITE`.
        *   **Algoritmo de Segunda Chance:** Quando é necessário liberar um quadro e não há livres, o paginador percorre os quadros circularmente (Clock). Se a página no quadro atual tiver o bit `referenced` ligado, o paginador lhe dá uma "segunda chance": zera o bit `referenced` e remove todas as permissões de acesso (`PROT_NONE`). Isso garante que o próximo acesso à página gere uma falha, permitindo ao paginador saber que ela foi referenciada novamente (restaurando as permissões e o bit `referenced`). Se o bit `referenced` já for zero, a página é eleita para substituição (eviction).
        *   **Otimização de Disco:** Adicionamos um flag `disk_valid`. Páginas que foram apenas alocadas e zeradas (`mmu_zero_fill`), mas nunca escritas no disco (evictadas limpas), não precisam ser lidas do disco quando trazidas de volta; basta zerá-las novamente. Isso economiza operações de I/O.
+
+5. Extra: documentação do código
+
+    1. Arquitetura do sistema de memória virtual  
+
+        <img src="diagrama-pto-1.png" style="width: 40%;">  
+
+        O digrama ilustra a interação entre o processo do usuário (azul), a infraestrutura de hardware simulada (amarelo) e o paginador (laranja). Destacam-se o ciclo de tratamento de falhas de página (page faults) e o mecanismo de controle da memória física e armazenamento secundário via MMU.
+
+
+    2. Fluxograma do funcionamento de um gerenciador de memória virtual  
+
+        <img src="fluxograma.jpeg" style="width: 40%;height:20%">  
